@@ -1,4 +1,4 @@
-const CACHE_NAME = "badminton-coach-v1";
+const CACHE_NAME = "badminton-coach-v2";
 const SHELL_FILES = [
   "./",
   "./index.html",
@@ -23,21 +23,35 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// 只缓存同源的应用外壳；对 DeepSeek API 等跨域请求一律直接放行，不拦截。
+function putInCache(request, response) {
+  if (!response || !response.ok) return;
+  const copy = response.clone();
+  caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+}
+
+// 只处理同源请求；对 DeepSeek API 等跨域请求一律直接放行，不拦截。
+// 页面本身（HTML）网络优先，保证发新版后手机能拿到更新，断网时才用缓存；
+// 其余静态资源（图标、ffmpeg.wasm 解码引擎等）缓存优先，解码引擎只需下载一次。
 self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
+  const req = event.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
 
+  const isPage = req.mode === "navigate" || url.pathname.endsWith(".html") || url.pathname.endsWith("/");
+
+  if (isPage) {
+    event.respondWith(
+      fetch(req)
+        .then((resp) => { putInCache(req, resp); return resp; })
+        .catch(() => caches.match(req).then((c) => c || caches.match("./index.html")))
+    );
+    return;
+  }
+
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      return (
-        cached ||
-        fetch(event.request).then((resp) => {
-          const copy = resp.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
-          return resp;
-        })
-      );
-    })
+    caches.match(req).then((cached) =>
+      cached || fetch(req).then((resp) => { putInCache(req, resp); return resp; })
+    )
   );
 });

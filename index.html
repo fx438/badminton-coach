@@ -322,6 +322,7 @@
   function resetOutputs() {
     framesSection.hidden = true;
     framesRow.innerHTML = "";
+    setFramesStatus(null);
     frameDataUrls = [];
     errorSection.hidden = true;
     errorSection.innerHTML = "";
@@ -340,8 +341,11 @@
     videoPreview.hidden = false;
     targetCard.hidden = false;
 
-    waitForVideoReady(videoPreview)
-      .then(() => extractFrames(videoPreview, NUM_FRAMES))
+    framesSection.hidden = false;
+    setFramesStatus("正在读取视频…");
+
+    waitForDuration(videoPreview)
+      .then((duration) => runExtraction(videoPreview, file, duration, NUM_FRAMES))
       .then((frames) => {
         frameDataUrls = frames;
         framesRow.innerHTML = "";
@@ -350,31 +354,44 @@
           img.src = src;
           framesRow.appendChild(img);
         });
-        framesSection.hidden = false;
+        setFramesStatus(null);
         analyzeBtn.disabled = false;
       })
       .catch((err) => {
+        framesSection.hidden = true;
         showError("抽帧失败：" + err.message);
       });
   }
 
-  // 等待视频真正解码出尺寸信息（部分浏览器/时序下 loadedmetadata 触发时
-  // videoWidth/videoHeight 仍为 0），轮询直到拿到有效尺寸或超时。
-  function waitForVideoReady(videoEl, timeoutMs) {
-    timeoutMs = timeoutMs || 4000;
+  function setFramesStatus(text) {
+    let el = document.getElementById("framesStatus");
+    if (!text) {
+      if (el) el.remove();
+      return;
+    }
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "framesStatus";
+      el.className = "status-line";
+      el.innerHTML = '<div class="spinner"></div><span></span>';
+      framesRow.parentNode.insertBefore(el, framesRow);
+    }
+    el.querySelector("span").textContent = text;
+  }
+
+  // 只依赖容器层面的元数据（时长），不需要真正解码出画面，
+  // HEVC 等浏览器无法软解的视频也能读到 duration。
+  function waitForDuration(videoEl, timeoutMs) {
+    timeoutMs = timeoutMs || 6000;
     return new Promise((resolve, reject) => {
       const start = Date.now();
       function check() {
-        if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0 && isFinite(videoEl.duration)) {
-          resolve();
+        if (isFinite(videoEl.duration) && videoEl.duration > 0) {
+          resolve(videoEl.duration);
           return;
         }
         if (Date.now() - start > timeoutMs) {
-          reject(new Error(
-            "这个视频解码不出来，大概率是编码格式不支持（比如 HEVC/H.265）。" +
-            "去手机相机设置里把视频编码改成 H.264（有的机型叫「高效编码」关掉、" +
-            "或选「兼容性优先」），重新拍一段再试。"
-          ));
+          reject(new Error("无法读取视频时长，文件可能已损坏"));
           return;
         }
         requestAnimationFrame(check);
@@ -387,48 +404,163 @@
     });
   }
 
-  function extractFrames(videoEl, n) {
+  // 抽帧总入口：优先用浏览器原生 <video>+canvas（H.264 等常见格式秒开）；
+  // 如果浏览器解不出画面（常见于 HEVC/H.265，比如很多安卓机拍出来的视频），
+  // 自动切换到内置的 ffmpeg.wasm 软件解码，不需要用户去改手机相机设置。
+  async function runExtraction(videoEl, file, duration, n) {
+    try {
+      setFramesStatus("正在抽取关键帧…");
+      return await extractFramesCanvas(videoEl, duration, n, 1500);
+    } catch (canvasErr) {
+      setFramesStatus("该视频编码格式手机浏览器无法直接解码，正在启用兼容模式（首次需下载解码引擎，可能需要十几秒）…");
+      return await extractFramesFfmpeg(file, duration, n);
+    }
+  }
+
+  // 方案一：浏览器原生解码，走 canvas 截帧，速度快。
+  function extractFramesCanvas(videoEl, duration, n, readyTimeoutMs) {
     return new Promise((resolve, reject) => {
-      const duration = videoEl.duration;
-      if (!duration || !isFinite(duration)) {
-        reject(new Error("无法读取视频时长"));
-        return;
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = videoEl.videoWidth;
-      canvas.height = videoEl.videoHeight;
-      const ctx = canvas.getContext("2d");
-      const times = [];
-      for (let i = 0; i < n; i++) {
-        const t = n === 1 ? duration / 2 : (i * duration) / (n - 1);
-        times.push(Math.min(t, Math.max(0, duration - 0.05)));
-      }
-      const results = [];
-      let idx = 0;
-
-      function seekNext() {
-        if (idx >= times.length) {
-          resolve(results);
+      const readyStart = Date.now();
+      function waitDecodable() {
+        if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+          doExtract();
           return;
         }
-        videoEl.currentTime = times[idx];
-      }
-
-      function onSeeked() {
-        try {
-          ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-          results.push(canvas.toDataURL("image/jpeg", 0.85));
-        } catch (err) {
-          reject(err);
+        if (Date.now() - readyStart > readyTimeoutMs) {
+          reject(new Error("浏览器无法解码此视频"));
           return;
         }
-        idx++;
+        requestAnimationFrame(waitDecodable);
+      }
+
+      function doExtract() {
+        const canvas = document.createElement("canvas");
+        canvas.width = videoEl.videoWidth;
+        canvas.height = videoEl.videoHeight;
+        const ctx = canvas.getContext("2d");
+        const times = [];
+        for (let i = 0; i < n; i++) {
+          const t = n === 1 ? duration / 2 : (i * duration) / (n - 1);
+          times.push(Math.min(t, Math.max(0, duration - 0.05)));
+        }
+        const results = [];
+        let idx = 0;
+
+        function seekNext() {
+          if (idx >= times.length) {
+            resolve(results);
+            return;
+          }
+          videoEl.currentTime = times[idx];
+        }
+
+        function onSeeked() {
+          try {
+            ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+            if (dataUrl === "data:,") throw new Error("画面为空");
+            results.push(dataUrl);
+          } catch (err) {
+            videoEl.removeEventListener("seeked", onSeeked);
+            reject(err);
+            return;
+          }
+          idx++;
+          seekNext();
+        }
+
+        videoEl.addEventListener("seeked", onSeeked);
         seekNext();
       }
 
-      videoEl.addEventListener("seeked", onSeeked);
-      seekNext();
+      waitDecodable();
     });
+  }
+
+  // 方案二：ffmpeg.wasm 软件解码兜底，兼容浏览器原生不支持的编码格式。
+  // 这几个文件是同源自托管的（vendor/），不走 CDN：@ffmpeg/ffmpeg 的
+  // worker.js 内部还有相对路径 import（"./const.js" 等），托管在跨域 CDN
+  // 上再用 blob URL 包一层会导致这些相对导入解析失败、静默卡死，所以把
+  // ffmpeg.wasm 的产物整份复制到本站点，同源就没有这个问题。
+  let ffmpegLoadPromise = null;
+  async function getFFmpeg() {
+    if (!ffmpegLoadPromise) {
+      ffmpegLoadPromise = (async () => {
+        const { FFmpeg } = await import("./vendor/ffmpeg/index.js");
+        const ffmpeg = new FFmpeg();
+        // 用绝对 URL：worker.js 内部会按它自己所在目录解析相对路径，
+        // 传相对路径会拼出错误地址，必须传完整地址消除歧义。
+        await ffmpeg.load({
+          coreURL: new URL("vendor/core/ffmpeg-core.js", location.href).href,
+          wasmURL: new URL("vendor/core/ffmpeg-core.wasm", location.href).href,
+        });
+        return ffmpeg;
+      })();
+    }
+    return ffmpegLoadPromise;
+  }
+
+  // 注意：@ffmpeg/core 0.12.10 的 mjpeg 编码器处理 720p 以上画面会
+  // "memory access out of bounds" 崩溃（HEVC 解码本身正常），所以这里
+  // 让 ffmpeg 输出 PNG，再交给浏览器 canvas 转成 JPEG（PNG 所有浏览器都能解）。
+  async function extractFramesFfmpeg(file, duration, n) {
+    const { fetchFile } = await import("./vendor/util/index.js");
+    let ffmpeg;
+    try {
+      ffmpeg = await getFFmpeg();
+    } catch (err) {
+      ffmpegLoadPromise = null;
+      throw new Error("兼容模式解码引擎加载失败，请检查网络后重试");
+    }
+
+    const inputName = "input_" + Date.now() + ".mp4";
+    await ffmpeg.writeFile(inputName, await fetchFile(file));
+
+    // 片尾最后几十毫秒经常 seek 不到可输出的帧，给最后一帧留点余量
+    const lastT = Math.max(0, duration - 0.3);
+    const results = [];
+    try {
+      for (let i = 0; i < n; i++) {
+        const t = n === 1 ? duration / 2 : (i * lastT) / (n - 1);
+        setFramesStatus(`兼容模式解码中…（${i + 1}/${n}）`);
+        results.push(await grabFramePng(ffmpeg, inputName, t));
+      }
+    } catch (err) {
+      // wasm 崩溃后实例不可再用，丢弃，下次重新加载
+      try { ffmpeg.terminate(); } catch (_) {}
+      ffmpegLoadPromise = null;
+      throw new Error("兼容模式解码失败：" + (err && err.message ? err.message : String(err)));
+    } finally {
+      if (ffmpegLoadPromise) await ffmpeg.deleteFile(inputName).catch(() => {});
+    }
+    return results;
+  }
+
+  async function grabFramePng(ffmpeg, inputName, t) {
+    const outName = "frame.png";
+    // 取不到帧时往前退 0.2s 再试，最多 3 次
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const tt = Math.max(0, t - attempt * 0.2);
+      await ffmpeg.exec(["-ss", tt.toFixed(3), "-i", inputName, "-frames:v", "1", outName]);
+      try {
+        const data = await ffmpeg.readFile(outName);
+        await ffmpeg.deleteFile(outName).catch(() => {});
+        return await pngToJpegDataURL(new Blob([data.buffer], { type: "image/png" }));
+      } catch (_) {
+        // 没有输出文件，继续往前退
+      }
+    }
+    throw new Error(`第 ${t.toFixed(1)} 秒附近取不到画面`);
+  }
+
+  async function pngToJpegDataURL(pngBlob) {
+    const bitmap = await createImageBitmap(pngBlob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0);
+    bitmap.close();
+    return canvas.toDataURL("image/jpeg", 0.85);
   }
 
   analyzeBtn.addEventListener("click", runAnalysis);
